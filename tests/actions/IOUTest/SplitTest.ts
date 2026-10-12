@@ -3562,6 +3562,139 @@ describe('updateSplitTransactionsFromSplitExpensesFlow', () => {
         expect(originalTransactionAfter?.reportID).toBe(CONST.REPORT.SPLIT_REPORT_ID);
     });
 
+    it('does not revert the remaining split and cleans up the empty expense report when 1 split was rejected onto an Open report and the other split on a Submitted report is removed', async () => {
+        // Given a 2-way split where child 1 was rejected onto an Open report and child 2 remains on a Submitted report
+        const openReport: Report = {
+            ...createRandomReport(10, undefined),
+            type: CONST.REPORT.TYPE.EXPENSE,
+            stateNum: CONST.REPORT.STATE_NUM.OPEN,
+            statusNum: CONST.REPORT.STATUS_NUM.OPEN,
+        };
+        const submittedReport: Report = {
+            ...createRandomReport(11, undefined),
+            type: CONST.REPORT.TYPE.EXPENSE,
+            stateNum: CONST.REPORT.STATE_NUM.SUBMITTED,
+            statusNum: CONST.REPORT.STATUS_NUM.SUBMITTED,
+        };
+        const originalTransactionID = 'vacation-delegate-split-original';
+        const rejectedChildTransactionID = 'vacation-delegate-split-rejected-child';
+        const submittedChildTransactionID = 'vacation-delegate-split-submitted-child';
+
+        const originalTransaction: Transaction = {
+            transactionID: originalTransactionID,
+            amount: -10000,
+            currency: 'USD',
+            merchant: 'Test Merchant',
+            comment: {comment: 'Original expense'},
+            created: DateUtils.getDBTime(),
+            reportID: CONST.REPORT.SPLIT_REPORT_ID,
+        };
+        const rejectedChildTransaction: Transaction = {
+            transactionID: rejectedChildTransactionID,
+            amount: -5000,
+            currency: 'USD',
+            merchant: 'Test Merchant',
+            comment: {comment: 'Split 1 comment', originalTransactionID, source: CONST.IOU.TYPE.SPLIT},
+            created: DateUtils.getDBTime(),
+            reportID: openReport.reportID,
+        };
+        const submittedChildTransaction: Transaction = {
+            transactionID: submittedChildTransactionID,
+            amount: -5000,
+            currency: 'USD',
+            merchant: 'Test Merchant',
+            comment: {comment: 'Split 2 comment', originalTransactionID, source: CONST.IOU.TYPE.SPLIT},
+            created: DateUtils.getDBTime(),
+            reportID: submittedReport.reportID,
+        };
+
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT}${openReport.reportID}`, openReport);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT}${submittedReport.reportID}`, submittedReport);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION}${originalTransactionID}`, originalTransaction);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION}${rejectedChildTransactionID}`, rejectedChildTransaction);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION}${submittedChildTransactionID}`, submittedChildTransaction);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION_VIOLATIONS}${rejectedChildTransactionID}`, [
+            {name: CONST.VIOLATIONS.AUTO_REPORTED_REJECTED_EXPENSE, type: CONST.VIOLATION_TYPES.VIOLATION},
+        ]);
+        await waitForBatchedUpdates();
+
+        let allTransactions: OnyxCollection<Transaction>;
+        let allReports: OnyxCollection<Report>;
+        let allReportNameValuePairs: OnyxCollection<ReportNameValuePairs>;
+        let allReportActions: OnyxCollection<ReportActions>;
+        await getOnyxData({key: ONYXKEYS.COLLECTION.TRANSACTION, callback: (value) => (allTransactions = value)});
+        await getOnyxData({key: ONYXKEYS.COLLECTION.REPORT, callback: (value) => (allReports = value)});
+        await getOnyxData({key: ONYXKEYS.COLLECTION.REPORT_NAME_VALUE_PAIRS, callback: (value) => (allReportNameValuePairs = value)});
+        await getOnyxData({key: ONYXKEYS.COLLECTION.REPORT_ACTIONS, callback: (value) => (allReportActions = value)});
+
+        // When the user removes the submitted child split while editing from the Submitted report, leaving only the rejected child split on the Open report
+        updateSplitTransactionsFromSplitExpensesFlow({
+            isVendorMatchingBetaEnabled: false,
+            rules: undefined,
+            getCurrencyDecimals: getCurrencyDecimalsLocal,
+            getCurrencySymbol: getCurrencySymbolLocal,
+            allTransactionsList: allTransactions,
+            allReportsList: allReports,
+            allReportActionsList: allReportActions,
+            allReportNameValuePairsList: allReportNameValuePairs,
+            allSnapshots: undefined,
+            transactionData: {
+                reportID: submittedReport.reportID,
+                originalTransactionID,
+                splitExpenses: [
+                    {
+                        transactionID: rejectedChildTransactionID,
+                        amount: 5000,
+                        description: 'Split 1 comment',
+                        created: DateUtils.getDBTime(),
+                        reportID: openReport.reportID,
+                    },
+                ],
+                splitExpensesTotal: 5000,
+            },
+            searchContext: {currentSearchHash: unapprovedCashHash},
+            policyCategories: undefined,
+            policy: undefined,
+            policyRecentlyUsedCategories: [],
+            iouReport: submittedReport,
+            firstIOU: undefined,
+            isASAPSubmitBetaEnabled: false,
+            currentUserPersonalDetails,
+            transactionViolations: {
+                [`${ONYXKEYS.COLLECTION.TRANSACTION_VIOLATIONS}${rejectedChildTransactionID}`]: [
+                    {name: CONST.VIOLATIONS.AUTO_REPORTED_REJECTED_EXPENSE, type: CONST.VIOLATION_TYPES.VIOLATION},
+                ],
+            },
+            policyRecentlyUsedCurrencies: [],
+            quickAction: undefined,
+            allPolicyTags: {},
+            personalDetails: {[RORY_ACCOUNT_ID]: {accountID: RORY_ACCOUNT_ID, login: RORY_EMAIL}},
+            transactionReport: submittedReport,
+            expenseReport: submittedReport,
+            isOffline: false,
+            delegateAccountID: CARLOS_ACCOUNT_ID,
+            isTrackIntentUser: false,
+            formatPhoneNumber,
+        });
+        await waitForBatchedUpdates();
+
+        // Then UPDATE_SPLIT_TRANSACTION is called instead of REVERT_SPLIT_TRANSACTION, and splits[0].comment is serialized as a plain string
+        const updateSplitCall = jest.mocked(writeWhenReady).mock.calls.find(([calledCommand]) => calledCommand === WRITE_COMMANDS.UPDATE_SPLIT_TRANSACTION);
+        expect(updateSplitCall).toBeDefined();
+        const revertSplitCall = jest.mocked(writeWhenReady).mock.calls.find(([calledCommand]) => calledCommand === WRITE_COMMANDS.REVERT_SPLIT_TRANSACTION);
+        expect(revertSplitCall).toBeUndefined();
+
+        expect(updateSplitCall?.[1]).toHaveProperty(['splits[0][comment]'], 'Split 1 comment');
+
+        // And the remaining rejected child is preserved, the original transaction remains hidden, and the now-empty Submitted report is cleaned up from Onyx
+        const rejectedChildAfter = await getOnyxValue(`${ONYXKEYS.COLLECTION.TRANSACTION}${rejectedChildTransactionID}`);
+        expect(rejectedChildAfter).toBeTruthy();
+        const originalTransactionAfter = await getOnyxValue(`${ONYXKEYS.COLLECTION.TRANSACTION}${originalTransactionID}`);
+        expect(originalTransactionAfter?.reportID).toBe(CONST.REPORT.SPLIT_REPORT_ID);
+        const submittedReportAfter = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${submittedReport.reportID}`);
+        expect(submittedReportAfter).toBeUndefined();
+    });
+
     it('should show the reverted transaction in search snapshots (not stale children) when reverting a pure selfDM split', async () => {
         // Given a selfDM report with an unreported expense that was split into two selfDM children
         const selfDMReport = createSelfDM(2, RORY_ACCOUNT_ID);
@@ -4900,6 +5033,147 @@ describe('updateSplitTransactionsFromSplitExpensesFlow', () => {
         // Then navigation should go to the expense report since it still exists
 
         expect(Navigation.dismissModalWithReport).toHaveBeenCalledWith({reportID: expenseReport.reportID}, expect.anything(), {forceReplace: false});
+    });
+
+    it('should navigate back to ROUTES.INBOX when removing the last split transaction on a report whose parent chat report is inaccessible (e.g. vacation delegate)', async () => {
+        const Navigation = jest.requireMock('@src/libs/Navigation/Navigation');
+        const Report = jest.requireMock('@src/libs/actions/Report');
+
+        // Given an expense report whose only split transaction is being removed, and whose parent policy expense chat
+        // is inaccessible to the current user (hasParentAccess: false and not in allReportsList)
+        const inaccessibleChatReportID = 'inaccessible-parent-chat-report';
+        const expenseReport: Report = {
+            ...createRandomReport(23, undefined),
+            type: CONST.REPORT.TYPE.EXPENSE,
+            stateNum: CONST.REPORT.STATE_NUM.SUBMITTED,
+            statusNum: CONST.REPORT.STATUS_NUM.SUBMITTED,
+            chatReportID: inaccessibleChatReportID,
+            parentReportID: inaccessibleChatReportID,
+            hasParentAccess: false,
+        };
+        const otherExpenseReport: Report = {
+            ...createRandomReport(24, undefined),
+            type: CONST.REPORT.TYPE.EXPENSE,
+            stateNum: CONST.REPORT.STATE_NUM.OPEN,
+            statusNum: CONST.REPORT.STATUS_NUM.OPEN,
+        };
+        const originalTransaction: Transaction = {
+            amount: -10000,
+            currency: 'USD',
+            transactionID: 'orig-nav-inaccessible',
+            reportID: CONST.REPORT.SPLIT_REPORT_ID,
+            created: DateUtils.getDBTime(),
+            merchant: 'test',
+        };
+        const removedChildTransaction: Transaction = {
+            amount: -5000,
+            currency: 'USD',
+            transactionID: 'removed-child-nav-inaccessible',
+            reportID: expenseReport.reportID,
+            created: DateUtils.getDBTime(),
+            merchant: 'test',
+            comment: {
+                originalTransactionID: originalTransaction.transactionID,
+                source: CONST.IOU.TYPE.SPLIT,
+            },
+        };
+        const remainingChildTransaction: Transaction = {
+            amount: -5000,
+            currency: 'USD',
+            transactionID: 'remaining-child-nav-inaccessible',
+            reportID: otherExpenseReport.reportID,
+            created: DateUtils.getDBTime(),
+            merchant: 'test',
+            comment: {
+                originalTransactionID: originalTransaction.transactionID,
+                source: CONST.IOU.TYPE.SPLIT,
+            },
+        };
+
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT}${expenseReport.reportID}`, expenseReport);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT}${otherExpenseReport.reportID}`, otherExpenseReport);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION}${originalTransaction.transactionID}`, originalTransaction);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION}${removedChildTransaction.transactionID}`, removedChildTransaction);
+        await Onyx.merge(`${ONYXKEYS.COLLECTION.TRANSACTION}${remainingChildTransaction.transactionID}`, remainingChildTransaction);
+
+        let allTransactions: OnyxCollection<Transaction>;
+        let allReports: OnyxCollection<Report>;
+        let allReportNameValuePairs: OnyxCollection<ReportNameValuePairs>;
+        await getOnyxData({
+            key: ONYXKEYS.COLLECTION.TRANSACTION,
+            callback: (value) => {
+                allTransactions = value;
+            },
+        });
+        await getOnyxData({
+            key: ONYXKEYS.COLLECTION.REPORT,
+            callback: (value) => {
+                allReports = value;
+            },
+        });
+        await getOnyxData({
+            key: ONYXKEYS.COLLECTION.REPORT_NAME_VALUE_PAIRS,
+            callback: (value) => {
+                allReportNameValuePairs = value;
+            },
+        });
+
+        const allPolicyTags = await getAllPolicyTags();
+        const reports = getTransactionAndExpenseReports(expenseReport.reportID);
+
+        // When the vacation delegate removes the only split transaction on the Submitted expense report
+        updateSplitTransactionsFromSplitExpensesFlow({
+            isVendorMatchingBetaEnabled: false,
+            rules: undefined,
+            getCurrencyDecimals: getCurrencyDecimalsLocal,
+            getCurrencySymbol: getCurrencySymbolLocal,
+            allTransactionsList: allTransactions,
+            allReportsList: allReports,
+            allReportActionsList: undefined,
+            allReportNameValuePairsList: allReportNameValuePairs,
+            transactionData: {
+                reportID: expenseReport.reportID,
+                originalTransactionID: originalTransaction.transactionID,
+                splitExpenses: [
+                    {
+                        transactionID: remainingChildTransaction.transactionID,
+                        amount: 5000,
+                        created: DateUtils.getDBTime(),
+                        reportID: otherExpenseReport.reportID,
+                    },
+                ],
+                splitExpensesTotal: 5000,
+            },
+            searchContext: {
+                currentSearchHash: -2,
+            },
+            policyCategories: undefined,
+            policy: undefined,
+            policyRecentlyUsedCategories: [],
+            iouReport: expenseReport,
+            firstIOU: undefined,
+            isASAPSubmitBetaEnabled: false,
+            currentUserPersonalDetails,
+            transactionViolations: {},
+            policyRecentlyUsedCurrencies: [],
+            quickAction: undefined,
+            allPolicyTags,
+            personalDetails: {[RORY_ACCOUNT_ID]: {accountID: RORY_ACCOUNT_ID, login: RORY_EMAIL}},
+            transactionReport: reports.transactionReport,
+            expenseReport: reports.expenseReport,
+            isOffline: false,
+            delegateAccountID: CARLOS_ACCOUNT_ID,
+            isTrackIntentUser: false,
+            formatPhoneNumber,
+        });
+
+        await waitForBatchedUpdates();
+
+        // Then it should navigate back to ROUTES.INBOX instead of the inaccessible parent chat report
+        expect(Report.setDeleteTransactionNavigateBackUrl).toHaveBeenCalledWith(ROUTES.INBOX);
+        expect(Navigation.dismissToSuperWideRHP).toHaveBeenCalled();
+        expect(Navigation.goBack).toHaveBeenCalledWith(ROUTES.INBOX);
+        expect(Navigation.dismissModalWithReport).not.toHaveBeenCalled();
     });
 });
 

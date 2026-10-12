@@ -29,7 +29,14 @@ function updateSplitTransactionsFromSplitExpensesFlow(params: UpdateSplitTransac
     const originalTransactionID = params.transactionData?.originalTransactionID ?? CONST.IOU.OPTIMISTIC_TRANSACTION_ID;
     const allChildTransactions = getChildTransactions(params.allTransactionsList, originalTransactionID);
     const currentSnapshotDataForSplits = params.allSnapshots?.[`${ONYXKEYS.COLLECTION.SNAPSHOT}${params.searchContext?.currentSearchHash}`]?.data;
-    const hasEditableSplitExpensesLeft = hasEditableSplitExpenseLeft(splitExpenses, params.allTransactionsList, params.allReportsList, currentSnapshotDataForSplits);
+    const hasEditableSplitExpensesLeft = hasEditableSplitExpenseLeft(
+        splitExpenses,
+        params.allTransactionsList,
+        params.allReportsList,
+        currentSnapshotDataForSplits,
+        allChildTransactions,
+        params.transactionViolations,
+    );
 
     // Unfiltered, so a pure selfDM 2-split still collapses via REVERT_SPLIT_TRANSACTION. The mixed
     // workspace/selfDM case is guarded below via reverseSplitKeepsOriginalInExpenseReport instead.
@@ -51,15 +58,21 @@ function updateSplitTransactionsFromSplitExpensesFlow(params: UpdateSplitTransac
     const expenseReportTransactions = expenseReportID ? Object.values(params.allTransactionsList ?? {}).filter((itemTransaction) => itemTransaction?.reportID === expenseReportID) : [];
     const areAllExpenseReportTransactionsSplitChildren =
         expenseReportTransactions.length > 0 && expenseReportTransactions.every((itemTransaction) => itemTransaction?.comment?.originalTransactionID === originalTransactionID);
-    const anyRemainingSplitStaysInExpenseReport = splitExpenses.some((expense) => expense.reportID === expenseReportID);
+    const anyRemainingSplitStaysInExpenseReport = splitExpenses.some((expense) => {
+        const splitReportID = expense.reportID ?? params.allTransactionsList?.[`${ONYXKEYS.COLLECTION.TRANSACTION}${expense.transactionID}`]?.reportID;
+        return splitReportID === expenseReportID;
+    });
     const reverseSplitKeepsOriginalInExpenseReport = isReverseSplitOperation && splitExpenses.at(0)?.reportID === expenseReportID;
     const willExpenseReportBecomeEmpty =
         !!expenseReportID && areAllExpenseReportTransactionsSplitChildren && !anyRemainingSplitStaysInExpenseReport && !reverseSplitKeepsOriginalInExpenseReport;
     const isLastTransactionInReport = willExpenseReportBecomeEmpty || (isReverseSplitOperation && !reverseSplitKeepsOriginalInExpenseReport && expenseReportTransactions.length === 1);
     const fallbackReportID = params.expenseReport?.chatReportID ?? params.expenseReport?.parentReportID;
+    const fallbackReport = fallbackReportID ? params.allReportsList?.[`${ONYXKEYS.COLLECTION.REPORT}${fallbackReportID}`] : undefined;
+    const hasAccessToFallbackReport = params.expenseReport?.hasParentAccess !== false && !!fallbackReport;
+    const backRoute = hasAccessToFallbackReport && fallbackReportID ? ROUTES.REPORT_WITH_ID.getRoute(fallbackReportID) : ROUTES.INBOX;
 
     if (isLastTransactionInReport && fallbackReportID) {
-        setDeleteTransactionNavigateBackUrl(ROUTES.REPORT_WITH_ID.getRoute(fallbackReportID));
+        setDeleteTransactionNavigateBackUrl(backRoute);
     }
 
     const isSearchPageTopmostFullScreenRoute = isSearchTopmostFullScreenRoute();
@@ -134,7 +147,6 @@ function updateSplitTransactionsFromSplitExpensesFlow(params: UpdateSplitTransac
         // Navigates to the fallback report, not the expense report - nothing mounts to consume the highlight rail.
         updateSplitTransactions({...params, isFromSplitExpensesFlow: true, shouldSkipReportHighlightRail: true});
 
-        const backRoute = ROUTES.REPORT_WITH_ID.getRoute(fallbackReportID);
         navigateBackOnDeleteTransaction(backRoute);
 
         // Remove the transaction thread report screen to avoid navigating back to a removed report
